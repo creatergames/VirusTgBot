@@ -4,36 +4,169 @@ import random
 import sqlite3
 import threading
 import os
-from flask import Flask
 from datetime import datetime, timedelta
+from flask import Flask
 
 # --- КОНФИГ ---
-TOKEN = '8527378266:AAGFVC1Mk85Thwfozwu2Dx7iMQ9NWGZYHVI'
+TOKEN = '8527378266:AAGFVC1Mk85Thwfozwu2Dx7iMQ9NWGZYHVI'  # Замени на свой токен
 URL = f"https://api.telegram.org/bot{TOKEN}/"
 
-# --- ВЕБ-СЕРВЕР (Чтобы Render не выключал бота) ---
+# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "Virus Game Server is Running!"
+    return "Virus Bot is active 24/7!"
 
 def run_web_server():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# --- БАЗА ДАННЫХ ---
-db = sqlite3.connect('virus_game.db', check_same_thread=False)
-sql = db.cursor()
-sql.execute('''CREATE TABLE IF NOT EXISTS users 
-               (id INTEGER PRIMARY KEY, name TEXT, level INTEGER, dna REAL, last_collect TIMESTAMP)''')
-sql.execute('''CREATE TABLE IF NOT EXISTS infections 
-               (victim_id INTEGER PRIMARY KEY, infector_id INTEGER, expiry TIMESTAMP)''')
-db.commit()
+# --- ИНИЦИАЛИЗАЦИЯ БД ---
+def init_db():
+    conn = sqlite3.connect('virus_game.db', check_same_thread=False)
+    sql = conn.cursor()
+    sql.execute('''CREATE TABLE IF NOT EXISTS users 
+                   (id INTEGER PRIMARY KEY, name TEXT, level INTEGER, dna REAL)''')
+    sql.execute('''CREATE TABLE IF NOT EXISTS infections 
+                   (victim_id INTEGER PRIMARY KEY, infector_id INTEGER, expiry TIMESTAMP)''')
+    conn.commit()
+    return conn
+
+db_conn = init_db()
 
 # --- ФУНКЦИИ ТЕЛЕГРАМ ---
 def send_msg(chat_id, text, reply_to=None):
-    params = {'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown'}
+    data = {'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown'}
+    if reply_to:
+        data['reply_to_message_id'] = reply_to
+    try:
+        requests.post(URL + 'sendMessage', data=data)
+    except Exception as e:
+        print(f"Error sending message: {e}")
+
+# --- ЛОГИКА ОБРАБОТКИ СООБЩЕНИЙ ---
+def process_message(msg):
+    if 'text' not in msg:
+        return
+
+    chat_id = msg['chat']['id']
+    user_id = msg['from']['id']
+    user_name = msg['from'].get('first_name', 'Герой')
+    text = msg['text']
+    sql = db_conn.cursor()
+
+    # 1. ПРИВЕТСТВИЕ
+    if text.startswith('/start'):
+        welcome = (
+            f"👋 *Приветствую в лаборатории, {user_name}!* 🦠\n\n"
+            "Здесь ты можешь создать свой уникальный вирус и заражать других людей в группе.\n\n"
+            "🎮 *Твой план действий:*\n"
+            "1️⃣ Назови вирус: `/create [Имя]`\n"
+            "2️⃣ Зарази цель: Ответь (reply) на сообщение человека командой `/infect`\n"
+            "3️⃣ Собирай ДНК: Команда `/collect` даст тебе ресурсы с жертв\n\n"
+            "🛡 *Правило:* Зараженный человек защищен от других вирусов на 24 часа."
+        )
+        send_msg(chat_id, welcome)
+
+    # 2. СОЗДАНИЕ ВИРУСА
+    elif text.startswith('/create'):
+        name = text.replace('/create', '').strip()
+        if not name:
+            send_msg(chat_id, "⚠️ Ошибка! Напиши `/create Название` (например: `/create Ebola`)")
+            return
+        
+        try:
+            sql.execute("INSERT INTO users VALUES (?, ?, 1, 0.0)", (user_id, name))
+            db_conn.commit()
+            send_msg(chat_id, f"🧪 *Вирус '{name}' создан!* Теперь иди в чат и зарази кого-нибудь через `/infect`.")
+        except sqlite3.IntegrityError:
+            send_msg(chat_id, "❌ У тебя уже есть вирус! Используй `/stats`, чтобы на него посмотреть.")
+
+    # 3. ЗАРАЖЕНИЕ (С ТВОИМИ УСЛОВИЯМИ)
+    elif text == '/infect':
+        if 'reply_to_message' not in msg:
+            send_msg(chat_id, "⚠️ Чтобы заразить, ты должен *ответить* своим сообщением на сообщение жертвы!")
+            return
+        
+        victim_id = msg['reply_to_message']['from']['id']
+        victim_name = msg['reply_to_message']['from'].get('first_name', 'Жертва')
+
+        if victim_id == user_id:
+            send_msg(chat_id, "😒 Ты не можешь заразить самого себя.")
+            return
+
+        # Проверка, есть ли вирус у игрока
+        sql.execute("SELECT name FROM users WHERE id = ?", (user_id,))
+        attacker = sql.fetchone()
+        if not attacker:
+            send_msg(chat_id, "❌ Сначала создай вирус: `/create [Имя]`")
+            return
+
+        # Проверка: не заражен ли уже?
+        now = datetime.now()
+        sql.execute("SELECT expiry, infector_id FROM infections WHERE victim_id = ?", (victim_id,))
+        current = sql.fetchone()
+
+        if current:
+            expiry_time = datetime.strptime(current[0], '%Y-%m-%d %H:%M:%S.%f')
+            if now < expiry_time:
+                send_msg(chat_id, f"🛡 *{victim_name}* уже заражен! Его иммунитет сопротивляется. Попробуй через 24 часа.")
+                return
+            else:
+                sql.execute("DELETE FROM infections WHERE victim_id = ?", (victim_id,))
+
+        # Успешное заражение на 1 день
+        expiry = now + timedelta(days=1)
+        sql.execute("INSERT INTO infections VALUES (?, ?, ?)", (victim_id, user_id, expiry))
+        db_conn.commit()
+        send_msg(chat_id, f"☣️ *Успех!* Твой вирус *{attacker[0]}* заразил *{victim_name}*.\n🔐 Жертва заблокирована для других вирусов на 24 часа!")
+
+    # 4. СБОР ЭНЕРГИИ
+    elif text == '/collect':
+        sql.execute("SELECT COUNT(*) FROM infections WHERE infector_id = ?", (user_id,))
+        victims_count = sql.fetchone()[0]
+        
+        if victims_count == 0:
+            send_msg(chat_id, "⚠️ Тебе не с кого собирать энергию. Сначала зарази людей через `/infect`!")
+            return
+
+        reward = victims_count * random.randint(10, 30)
+        sql.execute("UPDATE users SET dna = dna + ? WHERE id = ?", (reward, user_id))
+        db_conn.commit()
+        send_msg(chat_id, f"🔋 Ты собрал *{reward} ДНК* с своих жертв ({victims_count} чел.)!")
+
+    # 5. СТАТИСТИКА
+    elif text == '/stats':
+        sql.execute("SELECT name, level, dna FROM users WHERE id = ?", (user_id,))
+        v = sql.fetchone()
+        if v:
+            sql.execute("SELECT COUNT(*) FROM infections WHERE infector_id = ?", (user_id,))
+            v_count = sql.fetchone()[0]
+            send_msg(chat_id, f"🦠 *Вирус:* {v[0]}\n🧬 *Уровень:* {v[1]}\n⚡ *Энергия ДНК:* {v[2]}\n👥 *Твои жертвы:* {v_count}")
+        else:
+            send_msg(chat_id, "У тебя еще нет вируса. Создай его: `/create`.")
+
+# --- ГЛАВНЫЙ ЦИКЛ БОТА ---
+def bot_polling():
+    last_id = 0
+    while True:
+        try:
+            r = requests.get(URL + 'getUpdates', params={'offset': last_id + 1, 'timeout': 30}).json()
+            if r.get('result'):
+                for upd in r['result']:
+                    last_id = upd['update_id']
+                    if 'message' in upd:
+                        process_message(upd['message'])
+        except Exception as e:
+            print(f"Polling error: {e}")
+            time.sleep(5)
+
+if __name__ == '__main__':
+    # Запускаем веб-сервер в фоне
+    threading.Thread(target=run_web_server, daemon=True).start()
+    print("Bot is starting...")
+    bot_polling()
     if reply_to:
         params['reply_to_message_id'] = reply_to
     requests.post(URL + 'sendMessage', data=params)
