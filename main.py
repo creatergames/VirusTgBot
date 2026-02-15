@@ -8,32 +8,173 @@ from datetime import datetime, timedelta
 from flask import Flask
 
 # --- КОНФИГ ---
-TOKEN = '8527378266:AAGFVC1Mk85Thwfozwu2Dx7iMQ9NWGZYHVI'  # Замени на свой токен
+# Вставь сюда свой токен от @BotFather
+TOKEN = '8527378266:AAGFVC1Mk85Thwfozwu2Dx7iMQ9NWGZYHVI' 
 URL = f"https://api.telegram.org/bot{TOKEN}/"
 
-# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
+# --- ВЕБ-СЕРВЕР ---
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "Virus Bot is active 24/7!"
+    return "Virus Game Bot is Online!"
 
 def run_web_server():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# --- ИНИЦИАЛИЗАЦИЯ БД ---
-def init_db():
+# --- БАЗА ДАННЫХ ---
+def get_db_connection():
     conn = sqlite3.connect('virus_game.db', check_same_thread=False)
-    sql = conn.cursor()
-    sql.execute('''CREATE TABLE IF NOT EXISTS users 
-                   (id INTEGER PRIMARY KEY, name TEXT, level INTEGER, dna REAL)''')
-    sql.execute('''CREATE TABLE IF NOT EXISTS infections 
-                   (victim_id INTEGER PRIMARY KEY, infector_id INTEGER, expiry TIMESTAMP)''')
-    conn.commit()
     return conn
 
-db_conn = init_db()
+# Создаем таблицы при запуске
+def init_db():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS users 
+                      (id INTEGER PRIMARY KEY, name TEXT, level INTEGER, dna REAL)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS infections 
+                      (victim_id INTEGER PRIMARY KEY, infector_id INTEGER, expiry TIMESTAMP)''')
+    conn.commit()
+    conn.close()
+
+# --- ФУНКЦИИ ТЕЛЕГРАМ ---
+def send_msg(chat_id, text, reply_to=None):
+    data = {'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown'}
+    if reply_to:
+        data['reply_to_message_id'] = reply_to
+    try:
+        requests.post(URL + 'sendMessage', data=data)
+    except Exception as e:
+        print(f"Ошибка отправки: {e}")
+
+# --- ЛОГИКА КОМАНД ---
+def handle_update(update):
+    if 'message' not in update:
+        return
+    
+    msg = update['message']
+    if 'text' not in msg:
+        return
+
+    chat_id = msg['chat']['id']
+    user_id = msg['from']['id']
+    user_name = msg['from'].get('first_name', 'Игрок')
+    text = msg['text']
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # 1. СТАРТ
+    if text.startswith('/start'):
+        welcome = (
+            f"🦠 *Добро пожаловать, {user_name}!* 🦠\n\n"
+            "Ты — создатель вируса. Твоя цель: заразить всех!\n"
+            "📍 *Как играть:*\n"
+            "1️⃣ Назови вирус: `/create [Имя]`\n"
+            "2️⃣ Зарази цель: Ответь на чьё-то сообщение командой `/infect`\n"
+            "3️⃣ Собери энергию: Команда `/collect` даст ДНК\n\n"
+            "⚠️ *Зараженный блокируется на 24 часа!*"
+        )
+        send_msg(chat_id, welcome)
+
+    # 2. СОЗДАНИЕ
+    elif text.startswith('/create'):
+        virus_name = text.replace('/create', '').strip()
+        if not virus_name:
+            send_msg(chat_id, "⚠️ Напиши: `/create Название`")
+        else:
+            try:
+                cursor.execute("INSERT INTO users VALUES (?, ?, 1, 0.0)", (user_id, virus_name))
+                conn.commit()
+                send_msg(chat_id, f"✅ Вирус *{virus_name}* готов к биологической войне!")
+            except sqlite3.IntegrityError:
+                send_msg(chat_id, "❌ У тебя уже есть вирус.")
+
+    # 3. ЗАРАЖЕНИЕ
+    elif text == '/infect':
+        if 'reply_to_message' not in msg:
+            send_msg(chat_id, "⚠️ Ответь на сообщение того, кого хочешь заразить!")
+        else:
+            victim_id = msg['reply_to_message']['from']['id']
+            victim_name = msg['reply_to_message']['from'].get('first_name', 'Цель')
+
+            if victim_id == user_id:
+                send_msg(chat_id, "☣️ Нельзя заражать себя.")
+            else:
+                # Проверяем нападающего
+                cursor.execute("SELECT name FROM users WHERE id = ?", (user_id,))
+                attacker = cursor.fetchone()
+                if not attacker:
+                    send_msg(chat_id, "❌ Сначала создай вирус: `/create`")
+                else:
+                    # Проверяем жертву
+                    now = datetime.now()
+                    cursor.execute("SELECT expiry FROM infections WHERE victim_id = ?", (victim_id,))
+                    current = cursor.fetchone()
+
+                    if current:
+                        expiry_time = datetime.strptime(current[0], '%Y-%m-%d %H:%M:%S.%f')
+                        if now < expiry_time:
+                            send_msg(chat_id, f"🛡 *{victim_name}* уже кем-то заражен! Жди 24 часа.")
+                        else:
+                            cursor.execute("DELETE FROM infections WHERE victim_id = ?", (victim_id,))
+                            # Заражаем
+                            expiry = now + timedelta(days=1)
+                            cursor.execute("INSERT INTO infections VALUES (?, ?, ?)", (victim_id, user_id, expiry))
+                            conn.commit()
+                            send_msg(chat_id, f"☣️ *{attacker[0]}* успешно заразил *{victim_name}* на сутки!")
+                    else:
+                        expiry = now + timedelta(days=1)
+                        cursor.execute("INSERT INTO infections VALUES (?, ?, ?)", (victim_id, user_id, expiry))
+                        conn.commit()
+                        send_msg(chat_id, f"☣️ *{attacker[0]}* успешно заразил *{victim_name}* на сутки!")
+
+    # 4. СБОР
+    elif text == '/collect':
+        cursor.execute("SELECT COUNT(*) FROM infections WHERE infector_id = ?", (user_id,))
+        count = cursor.fetchone()[0]
+        if count == 0:
+            send_msg(chat_id, "💨 Нет активных заражений.")
+        else:
+            reward = count * random.randint(10, 50)
+            cursor.execute("UPDATE users SET dna = dna + ? WHERE id = ?", (reward, user_id))
+            conn.commit()
+            send_msg(chat_id, f"⚡ Ты собрал *{reward}* ДНК с *{count}* жертв!")
+
+    # 5. СТАТЫ
+    elif text == '/stats':
+        cursor.execute("SELECT name, level, dna FROM users WHERE id = ?", (user_id,))
+        v = cursor.fetchone()
+        if v:
+            cursor.execute("SELECT COUNT(*) FROM infections WHERE infector_id = ?", (user_id,))
+            v_count = cursor.fetchone()[0]
+            send_msg(chat_id, f"🦠 *{v[0]}*\n🧬 Уровень: {v[1]}\n⚡ ДНК: {v[2]}\n👥 Жертв: {v_count}")
+        else:
+            send_msg(chat_id, "Вируса нет.")
+
+    conn.close()
+
+# --- ПОЛЛИНГ ---
+def start_bot():
+    last_id = 0
+    init_db()
+    while True:
+        try:
+            response = requests.get(URL + 'getUpdates', params={'offset': last_id + 1, 'timeout': 30}).json()
+            if response.get('result'):
+                for update in response['result']:
+                    last_id = update['update_id']
+                    handle_update(update)
+        except Exception as e:
+            print(f"Ошибка сети: {e}")
+            time.sleep(5)
+
+if __name__ == '__main__':
+    threading.Thread(target=run_web_server, daemon=True).start()
+    print("Бот запускается...")
+    start_bot()
 
 # --- ФУНКЦИИ ТЕЛЕГРАМ ---
 def send_msg(chat_id, text, reply_to=None):
