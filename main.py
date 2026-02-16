@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from flask import Flask
 
 # --- КОНФИГ ---
-TOKEN = 'ВАШ_ТОКЕН_БОТА' 
+TOKEN = '8527378266:AAGFVC1Mk85Thwfozwu2Dx7iMQ9NWGZYHVI' 
 URL = f"https://api.telegram.org/bot{TOKEN}/"
 
 app = Flask('')
